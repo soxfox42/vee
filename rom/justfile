@@ -1,0 +1,31 @@
+_default:
+    @just --list
+
+
+export PATH := if os() == "macos" {
+    "/opt/homebrew/opt/llvm/bin:" + env("PATH")
+} else {
+    env("PATH")
+}
+ 
+# compile target.c into target.bin
+build target:
+    clang \
+        -target riscv32 -march=rv32i \
+        -nostdlib \
+        -Wl,-T vee.ld \
+        -O2 -flto \
+        {{target}}.c sbicall.c -o {{target}}.bin
+
+# hexdump the compiled binary
+hex target: (build target)
+    xxd {{target}}.bin
+
+# disassemble the compiled binary
+asm target: (build target)
+    llvm-objcopy \
+        -I binary -O elf32-littleriscv \
+        --rename-section=.data=.text,code \
+        {{target}}.bin {{target}}.elf
+    llvm-objdump -d {{target}}.elf
+    @rm -f {{target}}.elf
