@@ -7,6 +7,11 @@ export PATH := if os() == "macos" {
 } else {
     env("PATH")
 }
+
+optimise := "on"
+opt_flags := if optimise == "on" { "-O2 -flto" } else { "" }
+
+common_sources := "ecall.c core.c"
  
 # compile target.c into target.bin
 build target:
@@ -14,8 +19,8 @@ build target:
         -target riscv32 -march=rv32i \
         -nostdlib \
         -Wl,-T vee.ld \
-        -O2 -flto \
-        {{target}}.c sbicall.c -o {{target}}.bin
+        {{opt_flags}} \
+        {{target}}.c {{common_sources}} -o {{target}}.bin
 
 # hexdump the compiled binary
 hex target: (build target)

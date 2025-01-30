@@ -63,6 +63,10 @@ const RS2_SIZE: u32 = 5;
 const RS2_SHIFT: u32 = 20;
 const RS2_MASK: u32 = (1 << RS2_SIZE) - 1 << RS2_SHIFT;
 
+const FUNCT7_SIZE: u32 = 7;
+const FUNCT7_SHIFT: u32 = 25;
+const FUNCT7_MASK: u32 = (1 << FUNCT7_SIZE) - 1 << FUNCT7_SHIFT;
+
 struct Cpu {
     running: bool,
     pc: u32,
@@ -92,9 +96,39 @@ impl Cpu {
         }
     }
 
+    fn read_byte(ram: &[u8], addr: u32) -> u8 {
+        ram[addr as usize]
+    }
+
+    fn read_halfword(ram: &[u8], addr: u32) -> u16 {
+        ram[addr as usize] as u16 | (ram[addr as usize + 1] as u16) << 8
+    }
+
+    fn read_word(ram: &[u8], addr: u32) -> u32 {
+        ram[addr as usize] as u32
+            | (ram[addr as usize + 1] as u32) << 8
+            | (ram[addr as usize + 2] as u32) << 16
+            | (ram[addr as usize + 3] as u32) << 24
+    }
+
+    fn write_byte(ram: &mut [u8], addr: u32, value: u8) {
+        ram[addr as usize] = value;
+    }
+
+    fn write_halfword(ram: &mut [u8], addr: u32, value: u16) {
+        ram[addr as usize] = value as u8;
+        ram[addr as usize + 1] = (value >> 8) as u8;
+    }
+
+    fn write_word(ram: &mut [u8], addr: u32, value: u32) {
+        ram[addr as usize] = value as u8;
+        ram[addr as usize + 1] = (value >> 8) as u8;
+        ram[addr as usize + 2] = (value >> 16) as u8;
+        ram[addr as usize + 3] = (value >> 24) as u8;
+    }
+
     fn fetch(&mut self, ram: &[u8]) -> u32 {
-        let pc = self.pc as usize;
-        let value = u32::from_le_bytes(ram[pc..pc + 4].try_into().unwrap());
+        let value = Self::read_word(ram, self.pc);
         if DEBUG {
             println!("Fetched {value:08X}");
         }
@@ -140,14 +174,43 @@ impl Cpu {
         Self::sign_extend(value, 21)
     }
 
+    fn compute_op(input1: u32, input2: u32, funct3: u32, funct7: u32) -> u32 {
+        match funct3 {
+            0b000 => {
+                if funct7 & 0x20 == 0 {
+                    input1.wrapping_add(input2)
+                } else {
+                    input1.wrapping_sub(input2)
+                }
+            }
+            0b001 => input1.wrapping_shl(input2),
+            0b010 => ((input1 as i32) < input2 as i32) as u32,
+            0b011 => (input1 < input2) as u32,
+            0b100 => input1 ^ input2,
+            0b101 => {
+                if funct7 & 0x20 == 0 {
+                    input1.wrapping_shr(input1)
+                } else {
+                    (input1 as i32).wrapping_shr(input2) as u32
+                }
+            }
+            0b110 => input1 | input2,
+            0b111 => input1 & input2,
+            _ => unreachable!(),
+        }
+    }
+
     fn step(&mut self, ram: &mut [u8]) {
         assert!(self.pc & 3 == 0, "Misaligned PC");
         let inst = self.fetch(ram);
         let opcode = (inst & OPCODE_MASK) >> OPCODE_SHIFT;
         match opcode {
             0b0000011 => self.step_load(inst, ram),
+            0b0001111 => {} // FENCE is NOP
             0b0010011 => self.step_op_imm(inst),
+            0b0010111 => self.step_auipc(inst),
             0b0100011 => self.step_store(inst, ram),
+            0b0110011 => self.step_op(inst),
             0b0110111 => self.step_lui(inst),
             0b1100011 => self.step_branch(inst),
             0b1100111 => self.step_jalr(inst),
@@ -163,10 +226,14 @@ impl Cpu {
         let funct3 = (inst & FUNCT3_MASK) >> FUNCT3_SHIFT;
         let imm = Self::i_type_imm(inst);
 
-        let addr = self.read_reg(rs).wrapping_add(imm) as usize;
+        let addr = self.read_reg(rs).wrapping_add(imm);
 
         let value = match funct3 {
-            0b100 => ram[addr] as u32,
+            0b000 => Self::read_byte(ram, addr) as i8 as u32,
+            0b001 => Self::read_halfword(ram, addr) as i16 as u32,
+            0b010 => Self::read_word(ram, addr),
+            0b100 => Self::read_byte(ram, addr) as u32,
+            0b101 => Self::read_halfword(ram, addr) as u32,
             _ => panic!("Unsupported LOAD instruction {inst:08X}"),
         };
         self.write_reg(rd, value);
@@ -179,24 +246,20 @@ impl Cpu {
         let imm = Self::i_type_imm(inst);
 
         let input = self.read_reg(rs);
-        let output = match funct3 {
-            0b000 => input.wrapping_add(imm),
-            0b001 => input.wrapping_shl(imm),
-            0b010 => (input < imm) as u32,
-            0b011 => ((input as i32) < imm as i32) as u32,
-            0b100 => input ^ imm,
-            0b101 => {
-                if imm & 0x400 == 0 {
-                    input.wrapping_shr(imm)
-                } else {
-                    ((input as i32) >> (imm & 0x1F)) as u32
-                }
-            }
-            0b110 => input | imm,
-            0b111 => input & imm,
-            _ => unreachable!(),
-        };
+        let output = Self::compute_op(
+            input,
+            imm,
+            funct3,
+            if funct3 == 0b101 { imm >> 5 } else { 0 },
+        );
         self.write_reg(rd, output);
+    }
+
+    fn step_auipc(&mut self, inst: u32) {
+        let rd = (inst & RD_MASK) >> RD_SHIFT;
+        let imm = Self::u_type_imm(inst);
+        let value = self.pc - 4 + imm;
+        self.write_reg(rd, value);
     }
 
     fn step_store(&mut self, inst: u32, ram: &mut [u8]) {
@@ -205,13 +268,29 @@ impl Cpu {
         let funct3 = (inst & FUNCT3_MASK) >> FUNCT3_SHIFT;
         let imm = Self::s_type_imm(inst);
 
-        let addr = self.read_reg(rs1).wrapping_add(imm) as usize;
+        let addr = self.read_reg(rs1).wrapping_add(imm);
         let value = self.read_reg(rs2);
 
         match funct3 {
-            0b000 => ram[addr as usize] = (value & 0xFF) as u8,
-            _ => panic!("Unsupported STORE instruction {inst:08X}"),
+            0b000 => Self::write_byte(ram, addr, value as u8),
+            0b001 => Self::write_halfword(ram, addr, value as u16),
+            0b010 => Self::write_word(ram, addr, value as u32),
+            _ => panic!("Invalid STORE instruction {inst:08X}"),
         };
+    }
+
+    fn step_op(&mut self, inst: u32) {
+        let rd = (inst & RD_MASK) >> RD_SHIFT;
+        let rs1 = (inst & RS1_MASK) >> RS1_SHIFT;
+        let rs2 = (inst & RS2_MASK) >> RS2_SHIFT;
+        let funct3 = (inst & FUNCT3_MASK) >> FUNCT3_SHIFT;
+        let funct7 = (inst & FUNCT7_MASK) >> FUNCT7_SHIFT;
+
+        let input1 = self.read_reg(rs1);
+        let input2 = self.read_reg(rs2);
+        let output = Self::compute_op(input1, input2, funct3, funct7);
+
+        self.write_reg(rd, output);
     }
 
     fn step_lui(&mut self, inst: u32) {
@@ -230,7 +309,11 @@ impl Cpu {
         let cond = match funct3 {
             0b000 => a == b,
             0b001 => a != b,
-            _ => panic!("Unsupported BRANCH instruction {inst:08X}"),
+            0b100 => (a as i32) < (b as i32),
+            0b101 => (a as i32) >= (b as i32),
+            0b110 => a < b,
+            0b111 => a >= b,
+            _ => panic!("Invalid BRANCH instruction {inst:08X}"),
         };
         if cond {
             self.pc = self.pc.wrapping_add(addr - 4);
@@ -259,23 +342,28 @@ impl Cpu {
         let rd = (inst & RD_MASK) >> RD_SHIFT;
         let addr = Self::j_type_imm(inst);
         self.write_reg(rd, self.pc);
-        self.pc = self.pc.wrapping_add(addr - 4);
+        self.pc = self.pc.wrapping_add(addr) - 4;
     }
 
     fn step_system(&mut self, inst: u32) {
         match inst {
             0x00000073 => {
-                let eid = self.regs[17];
-                match eid {
-                    0x01 => {
+                let id = self.regs[17];
+                match id {
+                    0x01 => self.running = false,
+                    0x02 => {
                         let ch = self.regs[10];
-                        io::stdout().write_all(&[(ch & 0xFF) as u8]).unwrap();
+                        io::stdout().write_all(&[ch as u8]).unwrap();
                     }
-                    0x08 => {
-                        self.running = false;
+                    0x03 => {
+                        let num = self.regs[10];
+                        println!("Debug: {num:08X}");
                     }
-                    _ => panic!("Unsupported ECALL EID {eid:08X}"),
+                    _ => panic!("Unsupported ECALL ID {id:08X}"),
                 }
+            }
+            0x00100073 => {
+                // EBREAK is NOP
             }
             _ => panic!("Unsupported SYSTEM instruction {inst:08X}"),
         }
